@@ -1,6 +1,20 @@
+import random
+
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from matplotlib import cm
+
+
+def set_seed(seed=42):
+    """Lock RNG state across Python, NumPy, and PyTorch (CPU/CUDA)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def normalize01(x):
@@ -49,6 +63,52 @@ def save_panel(query, gt, pred, heatmap, out_path, title,
     else:
         im = ax4.imshow(heatmap, cmap=heatmap_cmap)
         plt.colorbar(im, ax=ax4, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
+def save_combined_xai_panel(
+    query,
+    gt,
+    pred,
+    gradcam,
+    shap_map,
+    out_path,
+    title,
+    gradcam_cmap="jet",
+    shap_cmap="coolwarm",
+):
+    """Save a 1x5 panel: query, GT, prediction, Grad-CAM overlay, SHAP heatmap."""
+    fig = plt.figure(figsize=(18, 4))
+
+    ax1 = plt.subplot(1, 5, 1)
+    ax1.set_title(f"Query: {title}", fontsize=10)
+    ax1.imshow(query, cmap="gray")
+    ax1.axis("off")
+
+    ax2 = plt.subplot(1, 5, 2)
+    ax2.set_title("Ground Truth Mask")
+    ax2.imshow(gt, cmap="gray")
+    ax2.axis("off")
+
+    ax3 = plt.subplot(1, 5, 3)
+    ax3.set_title("Base Prediction Mask")
+    ax3.imshow(pred, cmap="gray")
+    ax3.axis("off")
+
+    ax4 = plt.subplot(1, 5, 4)
+    ax4.set_title("Grad-CAM Overlay")
+    ax4.imshow(overlay_heatmap(query, gradcam, alpha=0.5, cmap=gradcam_cmap))
+    ax4.axis("off")
+
+    ax5 = plt.subplot(1, 5, 5)
+    ax5.set_title("SHAP Heatmap")
+    vmax = float(np.abs(shap_map).max()) or 1e-6
+    im = ax5.imshow(shap_map, cmap=shap_cmap, vmin=-vmax, vmax=vmax)
+    plt.colorbar(im, ax=ax5, fraction=0.046, pad=0.04)
+    ax5.axis("off")
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
