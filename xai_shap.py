@@ -39,7 +39,7 @@ def main():
         transform=transform
     )
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
     print("Model initializing...")
     model = universeg(pretrained=True).to(device)

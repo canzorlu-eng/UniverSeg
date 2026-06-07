@@ -2,13 +2,40 @@ import numpy as np
 import torch
 
 
+def _as_2d_shap_map(shap_values, spatial_shape):
+    """Reduce GradientExplainer output to a strict (H, W) attribution map."""
+    if isinstance(shap_values, list):
+        shap_values = shap_values[0]
+
+    sv = np.asarray(shap_values, dtype=np.float32)
+    h, w = spatial_shape
+
+    # Remove singleton batch / channel dims first (preferred path).
+    sv = np.squeeze(sv)
+    if sv.ndim == 2 and sv.shape == (h, w):
+        return sv
+
+    # Fallback layouts SHAP occasionally returns for image models.
+    if sv.ndim == 3:
+        if sv.shape[-2:] == (h, w):
+            return sv[0] if sv.shape[0] == 1 else sv.sum(axis=0)
+        if sv.shape[:2] == (h, w):
+            return sv[..., 0] if sv.shape[-1] == 1 else sv.sum(axis=-1)
+
+    if sv.ndim == 4 and sv.shape[-2:] == (h, w):
+        sv = sv[0]
+        return sv[0] if sv.shape[0] == 1 else sv.sum(axis=0)
+
+    raise ValueError(
+        f"Expected SHAP attributions reducible to ({h}, {w}), got shape {sv.shape}."
+    )
+
+
 def run_shap_gradient(model, query_img, support_imgs, support_masks, background_queries, device):
     """Run shap.GradientExplainer on the UniverSeg model.
 
-    The model is wrapped so SHAP sees a single input (the query image) and a
-    single scalar output (mean foreground probability). Supports are held
-    fixed inside the closure so the explanation isolates query-image
-    attributions.
+    Supports are frozen inside a wrapper so SHAP only perturbs the query image.
+    Segmentation logits are summed to a scalar so GradientExplainer can backprop.
 
     Args:
         model: trained UniverSeg model (on `device`, eval mode).
@@ -24,41 +51,55 @@ def run_shap_gradient(model, query_img, support_imgs, support_masks, background_
     import shap
 
     model.eval()
-    for p in model.parameters():
-        p.requires_grad_(True)
+    for param in model.parameters():
+        param.requires_grad_(True)
 
-    fixed_sup_imgs = support_imgs.detach()
-    fixed_sup_masks = support_masks.detach()
+    query = query_img.to(device).float()
+    if query.dim() == 3:
+        query = query.unsqueeze(0)
 
-    class Wrapped(torch.nn.Module):
-        def __init__(self, base):
+    background = background_queries.to(device).float().detach()
+    if background.dim() == 3:
+        background = background.unsqueeze(0)
+
+    if query.shape[1:] != background.shape[1:]:
+        raise ValueError(
+            f"query_img spatial shape {tuple(query.shape[1:])} must match "
+            f"background_queries {tuple(background.shape[1:])}."
+        )
+
+    spatial_shape = query.shape[-2:]
+
+    class QueryOnlyWrapper(torch.nn.Module):
+        """Expose only the query image to SHAP; freeze support set."""
+
+        def __init__(self, base, frozen_support_imgs, frozen_support_masks):
             super().__init__()
             self.base = base
+            self.register_buffer("support_imgs", frozen_support_imgs.detach())
+            self.register_buffer("support_masks", frozen_support_masks.detach())
 
-        def forward(self, q):
-            n = q.shape[0]
-            sup_i = fixed_sup_imgs.expand(n, -1, -1, -1, -1)
-            sup_l = fixed_sup_masks.expand(n, -1, -1, -1, -1)
-            logits = self.base(q, sup_i, sup_l)
-            probs = torch.sigmoid(logits)
-            return probs.mean(dim=(1, 2, 3), keepdim=True).view(n, 1)
+        def forward(self, query_batch):
+            batch_size = query_batch.shape[0]
+            sup_imgs = self.support_imgs.expand(batch_size, -1, -1, -1, -1)
+            sup_masks = self.support_masks.expand(batch_size, -1, -1, -1, -1)
+            logits = self.base(query_batch, sup_imgs, sup_masks)
+            # Scalar per sample: total predicted foreground logit mass.
+            return logits.sum(dim=(1, 2, 3), keepdim=True)
 
-    wrapped = Wrapped(model).to(device)
+    wrapped = QueryOnlyWrapper(
+        model,
+        support_imgs.to(device).float(),
+        support_masks.to(device).float(),
+    ).to(device)
     wrapped.eval()
 
-    background_queries = background_queries.to(device)
-    explainer = shap.GradientExplainer(wrapped, background_queries)
-
-    query = query_img.to(device)
+    explainer = shap.GradientExplainer(wrapped, background)
     shap_values = explainer.shap_values(query)
 
-    if isinstance(shap_values, list):
-        sv = shap_values[0]
-    else:
-        sv = shap_values
+    shap_map = _as_2d_shap_map(shap_values, spatial_shape)
 
-    sv = np.asarray(sv)
-    while sv.ndim > 2:
-        sv = sv.squeeze(0) if sv.shape[0] == 1 else sv.sum(axis=0)
+    for param in model.parameters():
+        param.requires_grad_(False)
 
-    return sv
+    return shap_map
